@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bus Tracking System</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css" />
+    <style>
+        body, html { 
+            margin: 0; 
+            padding: 0; 
+            height: 100%; 
+        }
+        #map { 
+            height: 100%;
+            width: 100%;
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+        .status-panel {
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+            z-index: 1000;
+            min-width: 200px;
+        }
+        .status-item {
+            margin: 8px 0;
+            font-size: 14px;
+        }
+        .status-item i {
+            width: 20px;
+            text-align: center;
+            margin-right: 8px;
+        }
+        .accuracy-high { color: #28a745; }
+        .accuracy-medium { color: #ffc107; }
+        .accuracy-low { color: #dc3545; }
+        #busInfo {
+            position: fixed;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: white;
+            padding: 10px 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+            z-index: 1000;
+        }
+        .error-message {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(220, 53, 69, 0.9);
+            color: white;
+            padding: 15px 30px;
+            border-radius: 8px;
+            display: none;
+            z-index: 2000;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <div class="status-panel">
+        <div class="status-item">
+            <i class="fas fa-signal"></i>
+            <span id="accuracy">Mencari sinyal GPS...</span>
+        </div>
+        <div class="status-item">
+            <i class="fas fa-tachometer-alt"></i>
+            <span id="speed">Kecepatan: 0 km/h</span>
+        </div>
+        <div class="status-item">
+            <i class="fas fa-compass"></i>
+            <span id="heading">Arah: -</span>
+        </div>
+        <div class="status-item">
+            <i class="fas fa-clock"></i>
+            <span id="lastUpdate">Update: -</span>
+        </div>
+        <div class="status-item">
+            <i class="fas fa-wifi"></i>
+            <span id="connectionStatus">Status: Terhubung</span>
+        </div>
+    </div>
+    <div id="busInfo">
+        Bus ID: <span id="busId">Loading...</span>
+    </div>
+    <div id="errorMessage" class="error-message"></div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        class BusTracker {
+            constructor() {
+                this.map = null;
+                this.marker = null;
+                this.accuracyCircle = null;
+                this.watchId = null;
+                this.busId = this.generateBusId();
+                this.serverUrl = 'https://98ed-2001-448a-1103-1dc6-44e6-be6e-1d2e-92f7.ngrok-free.app/';
+                this.lastUpdate = null;
+                this.retryTimeout = null;
+                
+                this.initializeMap()
+                    .then(() => this.startTracking())
+                    .catch(error => this.showError(error.message));
+                
+                this.updateBusIdDisplay();
+                this.setupConnectionMonitoring();
+            }
+
+            generateBusId() {
+                return 'BUS_' + Math.random().toString(36).substr(2, 9);
+            }
+
+            async initializeMap() {
+                try {
+                    // Inisialisasi dengan koordinat default (akan diupdate setelah dapat lokasi)
+                    this.map = L.map('map').setView([-6.200000, 106.816666], 13);
+                    
+                    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                        attribution: '© OpenStreetMap contributors'
+                    }).addTo(this.map);
+
+                    // Buat marker bus
+                    this.marker = L.marker([-6.200000, 106.816666]).addTo(this.map);
+                    
+                    // Buat circle untuk akurasi
+                    this.accuracyCircle = L.circle([-6.200000, 106.816666], {
+                        color: '#3388ff',
+                        fillColor: '#3388ff',
+                        fillOpacity: 0.1
+                    }).addTo(this.map);
+
+                    console.log('Map initialized successfully');
+                } catch (error) {
+                    console.error('Error initializing map:', error);
+                    throw new Error('Gagal menginisialisasi peta');
+                }
+            }
+
+            startTracking() {
+                if (!navigator.geolocation) {
+                    throw new Error('Geolocation tidak didukung di browser ini');
+                }
+
+                const options = {
+                    enableHighAccuracy: true,
+                    timeout: 5000,
+                    maximumAge: 0
+                };
+
+                this.watchId = navigator.geolocation.watchPosition(
+                    position => this.handlePosition(position),
+                    error => this.handleError(error),
+                    options
+                );
+            }
+
+            async handlePosition(position) {
+                const { latitude, longitude, accuracy, speed, heading } = position.coords;
+                const timestamp = position.timestamp;
+
+                // Update UI
+                this.updateMap(latitude, longitude, accuracy);
+                this.updateStatusPanel(position);
+
+                // Kirim ke server
+                try {
+                    await this.sendToServer({
+                        latitude,
+                        longitude,
+                        accuracy,
+                        speed: speed || 0,
+                        heading: heading || 0,
+                        timestamp
+                    });
+                    
+                    this.lastUpdate = new Date();
+                    document.getElementById('connectionStatus').textContent = 'Status: Terhubung';
+                    document.getElementById('connectionStatus').style.color = '#28a745';
+                } catch (error) {
+                    console.error('Error sending to server:', error);
+                    document.getElementById('connectionStatus').textContent = 'Status: Gagal terhubung';
+                    document.getElementById('connectionStatus').style.color = '#dc3545';
+                    this.scheduleRetry();
+                }
+            }
+
+            updateMap(latitude, longitude, accuracy) {
+                const position = [latitude, longitude];
+                this.marker.setLatLng(position);
+                this.accuracyCircle.setLatLng(position);
+                this.accuracyCircle.setRadius(accuracy);
+                
+                // Center map jika ini update pertama
+                if (!this.lastUpdate) {
+                    this.map.setView(position, 16);
+                }
+            }
+
+            updateStatusPanel(position) {
+                const { accuracy, speed, heading } = position.coords;
+                
+                // Update accuracy
+                const accuracyEl = document.getElementById('accuracy');
+                accuracyEl.textContent = `Akurasi: ${Math.round(accuracy)}m`;
+                accuracyEl.className = accuracy <= 10 ? 'accuracy-high' : 
+                                     accuracy <= 20 ? 'accuracy-medium' : 
+                                     'accuracy-low';
+
+                // Update speed
+                const speedKmh = speed ? (speed * 3.6).toFixed(1) : 0;
+                document.getElementById('speed').textContent = `Kecepatan: ${speedKmh} km/h`;
+
+                // Update heading
+                document.getElementById('heading').textContent = 
+                    heading ? `Arah: ${Math.round(heading)}°` : 'Arah: -';
+
+                // Update timestamp
+                document.getElementById('lastUpdate').textContent = 
+                    `Update: ${new Date().toLocaleTimeString()}`;
+            }
+
+            async sendToServer(data) {
+                const response = await fetch(`${this.serverUrl}/update-location`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        busId: this.busId,
+                        ...data
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error('Server error');
+                }
+            }
+
+            scheduleRetry() {
+                if (this.retryTimeout) {
+                    clearTimeout(this.retryTimeout);
+                }
+                this.retryTimeout = setTimeout(() => {
+                    if (this.lastUpdate) {
+                        this.handlePosition(this.lastUpdate);
+                    }
+                }, 5000);
+            }
+
+            handleError(error) {
+                let message;
+                switch(error.code) {
+                    case error.PERMISSION_DENIED:
+                        message = 'Akses lokasi ditolak';
+                        break;
+                    case error.POSITION_UNAVAILABLE:
+                        message = 'Lokasi tidak tersedia';
+                        break;
+                    case error.TIMEOUT:
+                        message = 'Timeout mendapatkan lokasi';
+                        break;
+                    default:
+                        message = 'Error tidak dikenal';
+                }
+                this.showError(message);
+            }
+
+            showError(message) {
+                const errorDiv = document.getElementById('errorMessage');
+                errorDiv.textContent = message;
+                errorDiv.style.display = 'block';
+                setTimeout(() => {
+                    errorDiv.style.display = 'none';
+                }, 5000);
+            }
+
+            updateBusIdDisplay() {
+                document.getElementById('busId').textContent = this.busId;
+            }
+
+            setupConnectionMonitoring() {
+                window.addEventListener('online', () => {
+                    document.getElementById('connectionStatus').textContent = 'Status: Terhubung';
+                    document.getElementById('connectionStatus').style.color = '#28a745';
+                    if (this.lastUpdate) {
+                        this.handlePosition(this.lastUpdate);
+                    }
+                });
+
+                window.addEventListener('offline', () => {
+                    document.getElementById('connectionStatus').textContent = 'Status: Offline';
+                    document.getElementById('connectionStatus').style.color = '#dc3545';
+                });
+            }
+
+            cleanup() {
+                if (this.watchId) {
+                    navigator.geolocation.clearWatch(this.watchId);
+                }
+                if (this.retryTimeout) {
+                    clearTimeout(this.retryTimeout);
+                }
+            }
+        }
+
+        // Inisialisasi tracker
+        let tracker;
+        window.onload = () => {
+            tracker = new BusTracker();
+        };
+
+        // Cleanup saat halaman ditutup
+        window.onbeforeunload = () => {
+            if (tracker) {
+                tracker.cleanup();
+            }
+        };
+    </script>
+</body>
+</html>
